@@ -39,44 +39,45 @@
 
 	// Simulate a loading delay (remove this in actual use)
 	onMount(() => {
+		// check the URL for initialization code
+		// 46 is 33 bytes public key + sep + terminal name (1 letter) * 0.75 (for base64)
+		// check the URL for initialization code
+		if (location.hash.length >= 46) {
+			try {
+				let b64Url = location.hash.substring(1);
+				let b64 = b64Url.replace(/-/g, '+').replace(/_/g, '/');
+				
+				// Pad with '=' if the length isn't a multiple of 4
+				while (b64.length % 4 !== 0) {
+					b64 += '=';
+				}
+
+				let binaryString = atob(b64);
+				let bytes = new Uint8Array(binaryString.length);
+				for (let i = 0; i < binaryString.length; i++) {
+					bytes[i] = binaryString.charCodeAt(i);
+				}
+				let linkingString = new TextDecoder().decode(bytes);
+
+				let parts = linkingString.split("\x1f");
+				if (parts.length >= 2) {
+					localStorage.setItem("public_key", parts[0]);
+					localStorage.setItem("terminal_name", parts[1]);
+					if (parts.length > 2) localStorage.setItem("business_name", parts[2]);
+					if (parts.length > 3) localStorage.setItem("merchant_email", parts[3]);
+					
+					// Clean up: Remove the hash from the URL so it isn't visible/re-processed on refresh
+					window.history.replaceState(null, null, window.location.pathname);
+				}
+			} catch (e) {
+				console.error("Failed to parse terminal setup link:", e);
+			}
+		}
+
 		let pubkey = localStorage.getItem("public_key");
 		let terminal_name = localStorage.getItem("terminal_name");
-		if (pubkey == null || terminal_name == null) {
-			// const qr = QRCode(0, "L"); // Type number 0 (auto) and error correction level 'L'
-			// tempToken = new Uint8Array(32);
-			// window.crypto.getRandomValues(tempToken);
-			// qr.addData("ff" + buf2hex(tempToken.buffer));
-			// console.log("ff" + buf2hex(tempToken.buffer));
-			// qr.make();
-			// qrCodeDataUrl = qr.createDataURL(12, 0); // Scale 8, margin 0
 
-			// let conn = new WebSocket(
-			// 	`wss://ln.tejory.io/streamevents?auth=ff${buf2hex(tempToken.buffer)}`,
-			// );
-			// conn.onclose = function (evt) {
-			// 	// if websocket fails, try to get the tx status from another API
-			// };
-			// conn.onmessage = function (evt) {
-			// 	var messages = evt.data.split("\n");
-			// 	for (var i = 0; i < messages.length; i++) {
-			// 		let obj = JSON.parse(messages[i]);
-			// 		if (
-			// 			obj["pubkey"] != undefined &&
-			// 			obj["terminal_name"] != undefined &&
-			// 			obj["token"] != undefined
-			// 		) {
-			// 			localStorage.setItem("pubkey", obj["pubkey"]);
-			// 			localStorage.setItem("terminal_name", obj["terminal_name"]);
-			// 			localStorage.setItem("token", obj["token"]);
-			// 			conn.close();
-			// 			initialized = true;
-			// 			setTimeout(() => {
-			// 				loading = false;
-			// 			}, 1000);
-			// 		}
-			// 	}
-			// };
-		} else {
+		if (pubkey != null && terminal_name != null) {
 			initialized = true;
 			setTimeout(() => {
 				loading = false;
