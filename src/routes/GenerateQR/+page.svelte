@@ -1,463 +1,524 @@
 <script>
-	import "../../app.css";
-	import { goto } from "$app/navigation";
-	import Modal from "./Modal.svelte";
-	import { onMount, onDestroy } from "svelte";
-	import { BleClient } from '@capacitor-community/bluetooth-le';
-	// QR code Generation
-	import QRCode from "qrcode-generator";
-	import { error } from "@sveltejs/kit";
+    import "../../app.css";
+    import { goto } from "$app/navigation";
+    import Modal from "./Modal.svelte";
+    import { onMount, onDestroy } from "svelte";
+    import QRCode from "qrcode-generator";
 
-	// Add these new variables to track your background processes
-	let qrInterval; 
-	let isComponentMounted = true;
-	
+    // Lifecycle & Process Management
+    let isComponentMounted = true;
+    let qrInterval; 
+    let activePollAborter = new AbortController();
 
-	let progress = $state(100);
-	let duration = 5 * 60000;
+    // Core Data
+    let cryptoId = $state("btc"); // 'btc', 'usdc', 'usdt'
+    let amountFiat = $state(0.0);
+    let fiatAmountBaseUSDB = $state(0);
+    let fiatSymbol = $state("USD");
+    
+    // UI State
+    let isGenerating = $state(true);
+    let generationError = $state("");
+    let isQRExpired = $state(false);
+    let isModalOpen = $state(false);
+    
+    // Payment State
+    let status = $state("pending"); // "pending", "success", "failed"
+    let qrStatus = $state(""); 
+    let qrMessage = $state("");
+    let paymentReference = $state("");
+    
+    // QR / Invoice Data
+    let qrCodeDataUrl = $state();
+    let invoiceData = $state(); 
+    let sats = $state("");
+    let cryptoAmountDisplay = $state("");
 
-	let intervalTime = 100;
-	let decrement = 100 / (duration / intervalTime);
-	let isQRExpired = $state(false);
-	let session = false;
-	let paymentCheckInterval;
-	let isModalOpen = $state(false);
-	let qrStatus = $state(""); // "success" or "error"
-	let qrMessage = $state("");
-	let amountFiat = $state(0.0);
-	let fiatAmountBaseUSDB = $state(0);
-	let paymentReference = $state("");
-	let fiatSymbol = $state("USD");
-	let status = $state();
-	let errorMessage = $state("Unknow error");
-	let sats = $state("");
-	let qrCodeDataUrl = $state();
-	let invoice = $state();
-	let invoiceId = null;
+    // Progress Bar
+    const duration = 5 * 60000; // 5 mins
+    const intervalTime = 100;
+    const decrement = 100 / (duration / intervalTime);
+    let progress = $state(100);
 
-	var dateOptions = {
-		weekday: "short",
-		year: "numeric",
-		month: "short",
-		day: "numeric",
-	};
-	var timeOptions = { hour12: true, hour: "2-digit", minute: "2-digit" };
+	// For partial payments
+	let amountReceived = $state(0);
+	let amountRemaining = $state(0);
 
-	function onclick() {
-		goto("Exchange");
-	}
+	let networkName = $derived(cryptoId === "btc" ? "Lightning" : (cryptoId === "usdc" ? "Solana" : "TRON"));
+	let tokenName = $derived(cryptoId === "btc" ? "Bitcoin" : cryptoId.toUpperCase());
 
-	function regenerateQR() {
-		isQRExpired = false;
-		progress = 100;
-		qrStatus = "";
-		qrMessage = "";
-		status = undefined; // Reset status so the error screen goes away
-		generateQrCode(fiatAmountBaseUSDB);
-	}
+    onMount(() => {
+        let current = localStorage.getItem("Currency");
+        if (current) fiatSymbol = current.toUpperCase();
 
-	// Simulate QR Scan Detection & Payment Check
-	async function checkPaymentStatus() {
-		try {
-			const response = await fetch("src/routes/GenerateQR/sample.json"); // Replace with actual API
-			const result1 = await response.json();
-			const result = result1[0];
-			if (result.status === "paid") {
-				qrStatus = "success";
-				qrMessage = "Your payment has been received!";
-				isModalOpen = true;
+        // Parse hash: #btc,100,1000000
+        const hashParts = location.hash.replace("#", "").split(",");
+        if (hashParts.length === 3) {
+            cryptoId = hashParts[0];
+            amountFiat = parseFloat(hashParts[1]);
+            fiatAmountBaseUSDB = parseInt(hashParts[2]);
+        }
 
-				clearInterval(paymentCheckInterval);
-			} else if (result.status === "failed") {
-				qrStatus = "error";
-				qrMessage = "Payment failed. Please try again.";
-				isModalOpen = true;
-				clearInterval(paymentCheckInterval);
-			}
-		} catch (error) {
-			console.error("Error checking payment status:", error);
+        startQrProcess();
+    });
+
+    onDestroy(() => {
+        isComponentMounted = false;
+        activePollAborter.abort(); // Cancel any pending fetch requests instantly
+        if (qrInterval) clearInterval(qrInterval);
+    });
+
+    function navigateHome() {
+        goto(`Exchange#${cryptoId}`);
+    }
+
+    async function startQrProcess() {
+        // Reset states
+        isGenerating = true;
+        generationError = "";
+        isQRExpired = false;
+        progress = 100;
+        status = "pending";
+        qrStatus = "";
+        qrMessage = "";
+        if (qrInterval) clearInterval(qrInterval);
+
+        // 15-second timeout to prevent infinite loading
+        const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error("Connection timed out. Please try again.")), 15000)
+        );
+
+        try {
+            if (cryptoId === "btc") {
+                await Promise.race([generateBtcQr(), timeoutPromise]);
+            } else {
+                await Promise.race([generateStablecoinQr(cryptoId), timeoutPromise]);
+            }
+            
+            // Start expiration visual countdown
+            qrInterval = setInterval(() => {
+                if (progress > 0) {
+                    progress = Math.max(progress - decrement, 0);
+                } else {
+                    clearInterval(qrInterval);
+                    isQRExpired = true;
+                }
+            }, intervalTime);
+
+        } catch (error) {
+            generationError = error.message || "Failed to generate QR code";
+            isGenerating = false;
+        }
+    }
+
+    // --- BTC LIGHTNING LOGIC ---
+    async function generateBtcQr() {
+        const reqObj = {
+            invoiceRequest: {
+                amountUSDCents: Math.round(fiatAmountBaseUSDB / 10_000),
+                publicKey: localStorage.getItem("public_key"),
+            }
+        };
+
+        const response = await fetch("https://faas-sgp1-18bc02ac.doserverless.co/api/v1/web/fn-a6380fe5-7756-40c6-81ae-70c49e8d07f9/tejoryinvoices/invoicerequest", {
+            method: "POST",
+            mode: "cors",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(reqObj),
+        });
+
+        const resObjRaw = await response.text();
+        const obj = JSON.parse(resObjRaw);
+
+        if (obj.status !== "ok") {
+            throw new Error(obj.err_msg || "Failed to create Lightning invoice");
+        }
+
+        invoiceData = obj.invoice;
+        sats = obj.amountSats;
+        cryptoAmountDisplay = (parseInt(sats) / 100000000).toFixed(8);
+
+        // Render QR
+        const qr = QRCode(0, "L");
+        qr.addData(invoiceData);
+        qr.make();
+        qrCodeDataUrl = qr.createDataURL(12, 0);
+        isGenerating = false;
+
+        // Fire & Forget Polling
+        pollBtcPayment(obj.invoiceId, obj.txId);
+    }
+
+    async function pollBtcPayment(invoiceId, tempTxId) {
+        const publicKey = localStorage.getItem("public_key");
+        const terminalName = localStorage.getItem("terminal_name");
+        let networkErrorCount = 0;
+
+        const reqObj = {
+            invoiceStatus: {
+                publicKey,
+                invoiceId,
+                txId: tempTxId, 
+                terminalId: terminalName,
+            }
+        };
+
+        while (!isQRExpired && status === "pending" && isComponentMounted) {
+            try {
+                const response = await fetch("https://faas-sgp1-18bc02ac.doserverless.co/api/v1/web/fn-a6380fe5-7756-40c6-81ae-70c49e8d07f9/tejoryinvoices/invoicerequest", {
+                    method: "POST",
+                    mode: "cors",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(reqObj),
+                    signal: activePollAborter.signal
+                });
+
+                if (!isComponentMounted) return; // Exit immediately if user navigated away during fetch
+                networkErrorCount = 0; // Reset network faults on successful reach
+
+                const obj = await response.json();
+
+                if (obj.status === "error" && response.status === 402) {
+                    // Still pending, wait 2 seconds before next poll
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    if (!isComponentMounted) return; 
+
+                } else if (obj.status === "error") {
+                    // Fatal Terminal Error
+                    qrStatus = "failed";
+                    qrMessage = obj.err_msg || "Payment failed";
+                    status = "failed";
+                    isModalOpen = true;
+                } else {
+                    // Success!
+                    paymentReference = obj.txId ? obj.txId.substring(obj.txId.length - 10) : "N/A";
+                    qrStatus = "success";
+                    qrMessage = "Your payment has been received!";
+                    status = "success";
+                    isModalOpen = true;
+                }
+                
+            } catch (error) {
+                if (!isComponentMounted || error.name === 'AbortError') return;
+                
+                networkErrorCount++;
+                if (networkErrorCount > 5) {
+                    // Max retries hit, likely lost Wi-Fi completely
+                    qrStatus = "failed";
+                    qrMessage = "Lost connection to payment server.";
+                    status = "failed";
+                    isModalOpen = true;
+                    break;
+                }
+                await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+        }
+    }
+
+    // --- STABLECOIN LOGIC (PLACEHOLDERS) ---
+    async function generateStablecoinQr(coinId) {
+        try {
+            // Determine the network based on the coinId
+            const network = coinId === "usdc" ? "Solana" : "TRON";
+            
+            // 1. Fetch address/payload using your new helper function
+            const addressData = await getStablecoinAddress(coinId.toUpperCase(), network);
+            
+            if (!addressData || !addressData.address) {
+                throw new Error(`Invalid address received for ${coinId.toUpperCase()}`);
+            }
+
+            // 2. Format cryptoAmountDisplay (Stablecoins are pegged 1:1 with USD)
+            // We use the amountFiat parsed from the URL hash earlier
+            cryptoAmountDisplay = amountFiat.toFixed(2);
+
+            // 3. Construct the exact string for the QR Code
+            if (coinId === "usdc") {
+                // Solana Pay URI format: solana:<address>?amount=<amount>&spl-token=<mint_address>
+                // The official SPL-token mint address for USDC on Solana mainnet is EPj...TDt1v
+                const usdcMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+                invoiceData = `solana:${addressData.address}?amount=${cryptoAmountDisplay}&spl-token=${usdcMint}`;
+				invoiceData = addressData.address;
+            } else if (coinId === "usdt") {
+                // TRON generally relies on just scanning the raw base58 address for TRC20 token transfers
+                // as not all wallets support a unified URI scheme like Solana Pay.
+                invoiceData = addressData.address; 
+            }
+
+            // Render QR Code
+            const qr = QRCode(0, "L");
+            qr.addData(invoiceData);
+            qr.make();
+            qrCodeDataUrl = qr.createDataURL(12, 0); // Scale 12, margin 0
+            
+            // Turn off the loading spinner
+            isGenerating = false;
+
+            // 4. Fire the polling function using the returned address ID
+            pollStablecoinPayment(coinId, addressData.address);
+            
+        } catch (error) {
+            console.error(`Error generating ${coinId.toUpperCase()} QR:`, error);
+            generationError = error.message || `Failed to setup ${coinId.toUpperCase()} payment`;
+            isGenerating = false;
+        }
+    }
+
+    async function pollStablecoinPayment(coinId, address) {
+        const publicKey = localStorage.getItem("public_key");
+        const terminalName = localStorage.getItem("terminal_name");
+        let networkErrorCount = 0;
+        
+        // Define network and formatting based on your Go code requirements
+        const network = coinId === "usdc" ? "solana" : "tron";
+        const expectedAmountStr = amountFiat.toFixed(2);
+
+        // Construct the payload mapping to your Go map[string]any
+        const reqObj = {
+            action: "get-stablecoin-balance", // Adjust this if your DO function uses a different action router
+            public_key: publicKey,
+            terminal_name: terminalName,
+            value_type: coinId.toUpperCase(),
+            address: address, 
+            amount: expectedAmountStr,
+            address_type: "internal",
+            transfer_types: network
+        };
+
+        while (!isQRExpired && status === "pending" && isComponentMounted) {
+            try {
+                const response = await fetch("https://faas-sgp1-18bc02ac.doserverless.co/api/v1/web/fn-a6380fe5-7756-40c6-81ae-70c49e8d07f9/get_usdb/sf_braleservices", {
+                    method: "POST",
+                    mode: "cors",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(reqObj),
+                    signal: activePollAborter.signal
+                });
+
+                if (!isComponentMounted) return; // Exit if user navigated away
+                networkErrorCount = 0; // Reset network faults
+
+                const httpStatus = response.status;
+                const obj = await response.json();
+
+                // 202 Accepted: Still processing (0 balance OR Partial Payment)
+                if (httpStatus === 202) {
+                    
+                    if (obj.status === "pending" && obj.amount_remaining) {
+                        // TODO for later: UI Update for Partial Payments
+                        // You can update the QR code here with a new expected amount, 
+                        // or show a warning to the user like:
+                        console.log(`Partial Payment Detected! Received: ${obj.amount_received}, Remaining: ${obj.amount_remaining}`);
+                    } else {
+                        // Standard waiting (0 balance)
+                        console.log("Waiting for payment on-chain...");
+                    }
+
+                    // On-chain txs are slower than Lightning. Wait 3-4 seconds to save DO bandwidth.
+                    await new Promise(resolve => setTimeout(resolve, 3500));
+                    if (!isComponentMounted) return;
+
+                } 
+                // 200 OK: Transfer completed and routed to Spark successfully
+                else if (httpStatus === 200 && obj.status === "ok") {
+                    // Assuming the Go 'tx' object has an 'id' or 'hash' field
+                    const txId = obj.txId ?? "N/A";
+                    paymentReference = txId !== "N/A" ? txId.substring(txId.length - 10) : "N/A";
+                    
+                    qrStatus = "success";
+                    qrMessage = "Your payment has been received!";
+                    status = "success";
+                    isModalOpen = true;
+                } 
+                // 400, 404, 409, 500: Fatal Errors (e.g. massive overpayment, unsupported network)
+                else {
+                    qrStatus = "failed";
+                    qrMessage = obj.err_msg || "Payment failed or rejected.";
+                    status = "failed";
+                    isModalOpen = true;
+                }
+                
+            } catch (error) {
+                if (!isComponentMounted || error.name === 'AbortError') return;
+                
+                networkErrorCount++;
+                if (networkErrorCount > 5) {
+                    // Max retries hit, likely lost Wi-Fi completely
+                    qrStatus = "failed";
+                    qrMessage = "Lost connection to payment server.";
+                    status = "failed";
+                    isModalOpen = true;
+                    break;
+                }
+                // Back-off slightly longer on network errors
+                await new Promise(resolve => setTimeout(resolve, 4000));
+            }
+        }
+    }
+
+	async function getStablecoinAddress(cryptoSymbol, network) {
+		const cacheKey = "TerminalAddresses";
+		
+		// 1. Check if we already have it in localStorage
+		let cachedData = JSON.parse(localStorage.getItem(cacheKey) || "{}");
+		
+		if (cachedData[cryptoSymbol] && cachedData[cryptoSymbol][network]) {
+			console.log(`Loaded ${cryptoSymbol} address from cache!`);
+			return cachedData[cryptoSymbol][network];
 		}
-	}
 
-	onMount(() => {
-		let current = localStorage.getItem("Currency").toUpperCase();
-		if (current != null) {
-			// console.log(current);
-			fiatSymbol = current;
-		}
-		let amounts = location.hash.replaceAll("#", "").split(",");
-		amountFiat = parseFloat(amounts[0]);
-		fiatAmountBaseUSDB = parseInt(amounts[1]);
-		generateQrCode(fiatAmountBaseUSDB);
-	});
+		// 2. If not, fetch it from your serverless function
+		console.log(`Fetching ${cryptoSymbol} address from server...`);
+		const publicKey = localStorage.getItem("public_key");
+		const terminalName = localStorage.getItem("terminal_name");
+		
+		// Replace this URL with dynamic params based on cryptoSymbol and network
+		const url = `https://faas-sgp1-18bc02ac.doserverless.co/api/v1/web/fn-a6380fe5-7756-40c6-81ae-70c49e8d07f9/get_usdb/sf_braleservices?action=get-stablecoin-address&public_key=${publicKey}&address_type=internal&transfer_types=${network.toLowerCase()}&terminal_name=${encodeURIComponent(terminalName)}`;
 
-	onDestroy(() => {
-		isComponentMounted = false; // Kills the streamEvents while-loop
-		if (qrInterval) clearInterval(qrInterval); // Kills the countdown
-	});
+		const response = await fetch(url);
+		const data = await response.json();
 
-	function generateQrCode(fiatAmountBaseUSDB) {
-		let reqObj = {
-			invoiceRequest: {
-				amountUSDCents: Math.round(fiatAmountBaseUSDB/10_000),
-				publicKey: localStorage.getItem("public_key"),
-			}
-		};
-
-		fetch("https://faas-sgp1-18bc02ac.doserverless.co/api/v1/web/fn-a6380fe5-7756-40c6-81ae-70c49e8d07f9/tejoryinvoices/invoicerequest", {
-			method: "POST",
-			mode: "cors",
-			headers: {
-				"Content-Type": "application/json",
-				// token: localStorage.getItem("token"),
-				// "Access-Control-Allow-Headers": "*",
-			},
-			body: JSON.stringify(reqObj),
-		}).then(async (response) => {
-			let resObjRaw = await response.text();
-			console.log(resObjRaw);
-
-			let obj = JSON.parse(resObjRaw);
-			// console.log(obj["status"]);
-			if (obj["status"] != "ok") {
-				status = false;
-				errorMessage = obj["err_msg"]?obj["err_msg"]:"Unknown error";
-			} else {
-				status = true;
-			}
-			const qr = QRCode(0, "L"); // Type number 0 (auto) and error correction level 'L'
-			invoice = obj["invoice"];
-			invoiceId = obj["invoiceId"];
-			const tempTxId = obj["txId"];
-			sats = obj["amountSats"];
-			// console.log(invoice, obj);
-			qr.addData(invoice);
-			qr.make();
-			qrCodeDataUrl = qr.createDataURL(12, 0); // Scale 8, margin 0
-
-			streamEvents(invoiceId, tempTxId);
-
-			// Start QR expiration countdown
-			// Clear any existing interval before starting a new one
-			if (qrInterval) clearInterval(qrInterval);
-
-			// Start QR expiration countdown
-			qrInterval = setInterval(() => {
-				if (progress > 0) {
-					progress = Math.max(progress - decrement, 0);
-				} else {
-					clearInterval(qrInterval);
-					isQRExpired = true;
-				}
-			}, intervalTime);
-
-			return () => {
-				clearInterval(interval);
+		if (data.status === "ok") {
+			// 3. Update the cache object
+			if (!cachedData[cryptoSymbol]) cachedData[cryptoSymbol] = {};
+			
+			cachedData[cryptoSymbol][network] = {
+				address: data.address, 
+				id: data.addressId 
 			};
-		});
-	}
 
-	async function streamEvents(invoiceId, tempTxId) {
-		let publicKey = localStorage.getItem("public_key");
-		let terminalName = localStorage.getItem("terminal_name");
-
-		const reqObj = {
-			invoiceStatus: {
-				publicKey: publicKey,
-				invoiceId: invoiceId,
-				txId: tempTxId, 
-				terminalId: terminalName,
-			}
-		};
-
-		let status = "pending";
-
-		// Safely block the loop using 'await'
-		while (!isQRExpired && status === "pending" && isComponentMounted) {
-			try {
-				const response = await fetch("https://faas-sgp1-18bc02ac.doserverless.co/api/v1/web/fn-a6380fe5-7756-40c6-81ae-70c49e8d07f9/tejoryinvoices/invoicerequest", {
-					method: "POST",
-					mode: "cors",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify(reqObj),
-				});
-
-				const resObjRaw = await response.text();
-				const obj = JSON.parse(resObjRaw);
-
-				if (obj.status === "error" && response.status === 402) {
-					// 402 Payment Required: Still pending.
-					// Wait 2 seconds before firing the next poll to spare DO resources.
-					await new Promise(resolve => setTimeout(resolve, 2000));
-					
-				} else if (obj.status === "error") {
-					// Terminal Error (e.g., HTLC claimed, swap failed)
-					qrStatus = "failed";
-					qrMessage = obj.err_msg || "Payment failed";
-					status = "failed";
-					isModalOpen = true;
-					
-				} else {
-					// Success! 200 OK
-					const txId = obj.txId; 
-					paymentReference = txId ? txId.substring(txId.length - 10) : "N/A";
-					qrStatus = "success";
-					qrMessage = "Your payment has been received!";
-					status = "success";
-					isModalOpen = true;
-				}
-				
-			} catch (error) {
-				console.error("Polling error:", error);
-				// Don't kill the loop on a temporary network hiccup, just wait and retry
-				await new Promise(resolve => setTimeout(resolve, 3000));
-			}
+			// 4. Save it back to localStorage
+			localStorage.setItem(cacheKey, JSON.stringify(cachedData));
+			
+			return cachedData[cryptoSymbol][network];
+		} else {
+			throw new Error("Failed to fetch stablecoin address");
 		}
 	}
-
-	// async function streamEvents(invoiceId, tempTxId) {
-	// 	let sparkAddress = localStorage.getItem("spark_address");
-
-	// 	const reqObj = {
-	// 		invoiceStatus: {
-	// 			sparkInvoice: sparkAddress,
-	// 			invoiceId: invoiceId,
-	// 			txId: tempTxId,
-	// 		}
-	// 	}
-
-	// 	let status = "pending";
-	// 	while (!isQRExpired && status == "pending") {
-	// 		fetch("https://faas-sgp1-18bc02ac.doserverless.co/api/v1/web/fn-a6380fe5-7756-40c6-81ae-70c49e8d07f9/tejoryinvoices/invoicerequest", {
-	// 			method: "POST",
-	// 			mode: "cors",
-	// 			headers: {
-	// 				"Content-Type": "application/json",
-	// 				// token: localStorage.getItem("token"),
-	// 				// "Access-Control-Allow-Headers": "*",
-	// 			},
-	// 			body: JSON.stringify(reqObj),
-	// 		}).then(async (response) => {
-	// 			let resObjRaw = await response.text();
-	// 			console.log(resObjRaw);
-
-	// 			let obj = JSON.parse(resObjRaw);
-	// 			// console.log(obj["status"]);
-	// 			if (obj["status"] == "error" && response.status == 402) {
-	// 				// pending payment
-	// 				await new Promise(resolve => setTimeout(resolve, 1000));
-	// 			} else if (obj["status"] == "error") {
-	// 				const txId = obj["txId"];
-	// 				paymentReference = txId.substring(txId.length-10);
-	// 				qrStatus = "failed";
-	// 				qrMessage = "Payment failed";
-	// 				status = "failed";
-	// 			} else {
-	// 				const txId = obj["txId"];
-	// 				paymentReference = txId.substring(txId.length-10);
-	// 				qrStatus = "success";
-	// 				qrMessage = "Your payment has been received!";
-	// 				status = "success";
-	// 			}
-				
-	// 			isModalOpen = true;
-	// 		});
-	// 	}
-	// }
 </script>
 
-{#if status != false}
-	<main class="flex h-dvh w-dvw flex-col">
-		<div
-			style="opacity:0.8; background-image:url(pattern.png);"
-			class="item-center absolute z-[-2] flex h-full w-full items-center justify-center bg-neutral-500"
-		></div>
-	<div
-			style="background-image: linear-gradient(to bottom, rgba(141, 141, 141, 0.45), rgba(0, 0, 0, 0.91));"
-			class="item-center absolute z-[-1] flex h-full w-full items-center justify-center"
-		></div>
-		<div class="main-content">
-			<section class="p-5 bg-[rgba(0,0,0,0.4)] rounded-2xl mx-2 mt-2">
-				<h1 class="font-bold text-white">Notice:</h1>
-				<p class="text-white">
-					This invoice will expire in <span class="text-red-500 font-bold">5
-					minutes.</span>
-				</p>
-			</section>
+<main class="relative flex h-dvh w-dvw flex-col items-center justify-center bg-transparent">
+    <!-- Backgrounds -->
+    <div style="background-image:url(pattern.png);" class="absolute inset-0 z-[-2] bg-neutral-500 opacity-80"></div>
+    <div style="background-image: linear-gradient(to bottom, rgba(141, 141, 141, 0.45), rgba(0, 0, 0, 0.91));" class="absolute inset-0 z-[-1]"></div>
 
-			<!-- Progress Bar -->
-			<div class="progress-container">
-				<div
-					class="progress-bar"
-					style="width: {progress}%; background-color:hsl({progress}, 100%, 50%);"
-				></div>
-			</div>
+    <!-- 1. REMOVED the 'main-content' class to prevent app.css from injecting a solid background -->
+    <div class="flex h-full w-full max-w-md flex-col items-center justify-center px-4">
+        
+        {#if isGenerating}
+            <!-- LOADING STATE -->
+            <div class="flex flex-col items-center justify-center gap-5 rounded-xl bg-white p-10 text-center shadow-2xl">
+                <div class="h-12 w-12 animate-spin rounded-full border-4 border-neutral-300 border-t-neutral-800"></div>
+                <p class="text-xl font-bold text-neutral-800">Generating Secure QR Code...</p>
+                <p class="text-neutral-500">Contacting payment server</p>
+            </div>
 
-			<section
-				class="bg-x relative flex flex-col items-center justify-center p-10 py-20"
-			>
-				{#if !isQRExpired}
-					<div>
-						{#if qrCodeDataUrl}
-							<p
-								class="mb-2 rounded bg-[#ffffffda] text-center font-bold text-3xl"
-							>
-								{fiatSymbol}
-								{amountFiat.toFixed(2)}
+        {:else if generationError}
+            <!-- FATAL GENERATION ERROR -->
+            <div class="flex flex-col items-center justify-center gap-6 rounded-xl bg-white p-8 text-center shadow-2xl">
+                <div class="flex h-16 w-16 items-center justify-center rounded-full bg-red-100">
+                    <svg class="h-8 w-8 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                    </svg>
+                </div>
+                <div>
+                    <h2 class="text-2xl font-bold text-neutral-800">Generation Failed</h2>
+                    <p class="mt-2 text-neutral-600">{generationError}</p>
+                </div>
+                <div class="mt-2 flex w-full gap-3">
+                    <button onclick={navigateHome} class="flex-1 rounded-lg bg-neutral-200 py-3 font-bold text-neutral-800 hover:bg-neutral-300">Back</button>
+                    <button onclick={startQrProcess} class="flex-1 rounded-lg bg-neutral-800 py-3 font-bold text-white hover:bg-neutral-700">Retry</button>
+                </div>
+            </div>
+
+        {:else}
+            <!-- ACTIVE QR OR EXPIRED STATE -->
+            <!-- 2. CHANGED to bg-white/10 (frosted glass) and increased blur -->
+            <div class="w-full overflow-hidden rounded-2xl border border-white/20 bg-white/10 shadow-2xl">
+                
+                <!-- Notice Header -->
+                <div class="bg-black/20 p-5 pb-3">
+                    <h1 class="font-bold text-white">Notice:</h1>
+                    <p class="text-white">This invoice will expire in <span class="font-bold text-red-400">5 minutes.</span></p>
+                </div>
+
+                <!-- Tailwind Progress Bar -->
+                <div class="h-2.5 w-full bg-black/40 shadow-[0_3px_5px_rgba(0,0,0,0.5)_inset]">
+                    <div 
+                        class="h-full transition-all duration-100 ease-linear" 
+                        style="width: {progress}%; background-color:hsl({progress}, 100%, 50%);"
+                    ></div>
+                </div>
+
+                <!-- QR Payload Area -->
+               <div class="flex flex-col items-center justify-center p-6 sm:p-8">
+					{#if !isQRExpired}
+						<div class="flex w-full flex-col items-center">
+							
+							<!-- PARTIAL PAYMENT WARNING -->
+							{#if amountReceived > 0}
+								<div class="mb-4 w-full animate-pulse rounded-lg border-2 border-orange-400 bg-orange-100 p-3 text-center shadow-lg">
+									<p class="font-bold text-orange-800">Partial Payment Detected</p>
+									<p class="text-sm font-medium text-orange-700">Received: {fiatSymbol} {amountReceived.toFixed(2)}</p>
+									<p class="mt-1 text-lg font-bold text-red-600">Still Owed: {fiatSymbol} {amountRemaining.toFixed(2)}</p>
+								</div>
+							{/if}
+
+							<!-- AMOUNT DISPLAY -->
+							<p class="mb-3 w-full rounded bg-white py-2 text-center text-3xl font-bold text-neutral-900 shadow-md transition-all">
+								{fiatSymbol} {amountRemaining > 0 ? amountRemaining.toFixed(2) : amountFiat.toFixed(2)}
 							</p>
-							<img
-								src={qrCodeDataUrl}
-								alt="QR Code"
-								class="w-full rounded-md border-15 border-white shadow-2xl shadow-black"
+							
+							<!-- NETWORK INDICATOR -->
+							<div class="mb-3 w-full rounded-md border border-white/20 bg-neutral-900 py-2 text-center text-sm font-bold text-white shadow-md">
+								Send {tokenName} via <span class="text-blue-400">{networkName}</span> Network
+							</div>
+							
+							<!-- QR CODE -->
+							<img 
+								src={qrCodeDataUrl} 
+								alt="Payment QR Code" 
+								class="w-full max-w-[350px] aspect-square rounded-lg border-[12px] border-white shadow-[0_10px_25px_rgba(0,0,0,0.8)] transition-all" 
 							/>
-						{/if}
-						<div class="relative w-full bg-[rgba(255,255,255,0.2)] font-mono text-white">
-							<p class="mt-6 w-62 p-1 overflow-hidden text-ellipsis">
-								{invoice}
-							</p>
+							
+							<!-- Invoice String -->
+							<div class="mt-6 w-full rounded bg-black/40 p-2">
+								<p class="w-full break-all font-mono text-sm text-white/80 line-clamp-2">
+									{invoiceData}
+								</p>
+							</div>
+
+							<button onclick={navigateHome} class="mt-6 w-full rounded-lg bg-red-600 py-4 text-lg font-bold text-white shadow-lg transition-colors hover:bg-red-700">
+								Cancel Invoice
+							</button>
 						</div>
+					{:else}
+						<!-- Expired State -->
+						<div class="flex flex-col items-center justify-center gap-6 py-10">
+							<div class="flex h-24 w-24 items-center justify-center rounded-full bg-black/40 shadow-inner">
+								<svg class="h-16 w-16 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+									<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+								</svg>
+							</div>
+							<p class="text-2xl font-bold text-white shadow-black drop-shadow-md">QR Code Expired</p>
+							<button onclick={startQrProcess} class="w-full rounded-lg bg-green-500 px-8 py-4 text-lg font-bold text-neutral-900 shadow-lg transition-colors hover:bg-green-400">
+								Regenerate new QR code
+							</button>
+						</div>
+					{/if}
+				</div>
+            </div>
+        {/if}
 
-						<button
-							{onclick}
-							class="mt-8 w-full rounded-lg bg-red-600 p-3 font-bold text-white"
-							>Cancel Invoice</button
-						>
-					</div>
-				{:else}
-					<div
-						class="flex min-h-69 w-[90%] flex-col items-center justify-center gap-5"
-					>
-						<svg
-							version="1.1"
-							id="Layer_1"
-							xmlns="http://www.w3.org/2000/svg"
-							xmlns:xlink="http://www.w3.org/1999/xlink"
-							viewBox="0 0 345.8 345.8"
-							enable-background="new 0 0 345.8 345.8"
-							xml:space="preserve"
-							width="128px"
-							height="128px"
-							fill="#000000"
-							><g id="SVGRepo_bgCarrier" stroke-width="0"></g><g
-								id="SVGRepo_tracerCarrier"
-								stroke-linecap="round"
-								stroke-linejoin="round"
-							></g><g id="SVGRepo_iconCarrier">
-								<g>
-									<circle
-										fill="none"
-										stroke="#FFFFFF"
-										stroke-width="0.75"
-										stroke-miterlimit="10"
-										cx="172.9"
-										cy="172.9"
-										r="172.5"
-									></circle>
-									<circle
-										fill="#E1473F"
-										cx="172.9"
-										cy="172.9"
-										r="172.5"
-									></circle>
-									<circle
-										fill="#FF5F57"
-										cx="172.9"
-										cy="172.9"
-										r="157.5"
-									></circle>
-									<g>
-										<path
-											fill="#752521"
-											d="M160.4,80.4c5.7-5.3,12.4-8,20.1-8c7.8,0,14.5,2.7,20.1,8c5.6,5.3,8.3,11.7,8.3,19.3 c0,3.7-0.8,9.3-2.3,16.6c-1.6,7.4-3.3,14.9-5.1,22.6c-2.1,8.4-4.4,18.8-7,31.2c-2.6,12.4-5.4,27.9-8.3,46.6h-11.3 c-2.9-18.5-5.7-34-8.3-46.5c-2.6-12.5-5-23-7-31.4c-2.1-8.9-3.9-16.6-5.3-23.2c-1.4-6.6-2.1-11.9-2.1-15.9 C151.9,92.1,154.7,85.7,160.4,80.4z M160.6,242.2c5.6-5.4,12.2-8.1,19.7-8.1c7.6,0,14.2,2.7,19.8,8.1c5.6,5.4,8.4,11.8,8.4,19.3 c0,7.4-2.8,13.8-8.4,19.1c-5.6,5.3-12.2,8-19.8,8c-7.5,0-14.1-2.7-19.7-8c-5.6-5.3-8.4-11.7-8.4-19.1 C152.2,254.1,155,247.6,160.6,242.2z"
-										></path>
-									</g>
-									<g>
-										<path
-											fill="#FFFFFF"
-											d="M152.9,72.8c5.7-5.3,12.4-8,20.1-8c7.8,0,14.5,2.7,20.1,8c5.6,5.3,8.3,11.7,8.3,19.3 c0,3.7-0.8,9.3-2.3,16.6c-1.6,7.4-3.3,14.9-5.1,22.6c-2.1,8.4-4.4,18.8-7,31.2c-2.6,12.4-5.4,27.9-8.3,46.6h-11.3 c-2.9-18.5-5.7-34-8.3-46.5c-2.6-12.5-5-23-7-31.4c-2.1-8.9-3.9-16.6-5.3-23.2c-1.4-6.6-2.1-11.9-2.1-15.9 C144.4,84.5,147.2,78.1,152.9,72.8z M153.1,234.6c5.6-5.4,12.2-8.1,19.7-8.1c7.6,0,14.2,2.7,19.8,8.1c5.6,5.4,8.4,11.8,8.4,19.3 c0,7.4-2.8,13.8-8.4,19.1c-5.6,5.3-12.2,8-19.8,8c-7.5,0-14.1-2.7-19.7-8c-5.6-5.3-8.4-11.7-8.4-19.1 C144.7,246.5,147.5,240,153.1,234.6z"
-										></path>
-									</g>
-								</g>
-							</g></svg
-						>
-						<p class="text-xl">Qr Code has Expired</p>
-						<button onclick={regenerateQR} class="bg-green-400 p-3">
-							Regenerate new QR code</button
-						>
-					</div>
-					<!-- <p class="absolute bottom-5 left-10 max-w-[80%] overflow-hidden text-ellipsis">
-					{invoice}
-				</p> -->
-				{/if}
-			</section>
-
-			<!-- Modal Alert -->
-			<Modal
-				isOpen={isModalOpen}
-				message={qrMessage}
-				status={qrStatus}
-				amountCrypto={parseInt(sats) / 100000000}
-				cryptoSymbol={"BTC"}
-				{amountFiat}
-				{fiatSymbol}
-				{paymentReference}
-			/>
-		</div>
-	</main>
-{:else}
-	<main
-		class="flex h-dvh w-dvw flex-col justify-center items-center text-center gap-3 bg-neutral-200"
-	>
-		<div
-			class="bg-white flex flex-col gap-9 p-3 text-center rounded shadow-lg"
-		>
-			<div class="flex gap-3">
-				<svg
-					width="35px"
-					height="35px"
-					viewBox="0 0 16 16"
-					fill="none"
-					xmlns="http://www.w3.org/2000/svg"
-					><g id="SVGRepo_bgCarrier" stroke-width="0"></g><g
-						id="SVGRepo_tracerCarrier"
-						stroke-linecap="round"
-						stroke-linejoin="round"
-					></g><g id="SVGRepo_iconCarrier"
-						><path
-							d="M7.493 0.015 C 7.442 0.021,7.268 0.039,7.107 0.055 C 5.234 0.242,3.347 1.208,2.071 2.634 C 0.660 4.211,-0.057 6.168,0.009 8.253 C 0.124 11.854,2.599 14.903,6.110 15.771 C 8.169 16.280,10.433 15.917,12.227 14.791 C 14.017 13.666,15.270 11.933,15.771 9.887 C 15.943 9.186,15.983 8.829,15.983 8.000 C 15.983 7.171,15.943 6.814,15.771 6.113 C 14.979 2.878,12.315 0.498,9.000 0.064 C 8.716 0.027,7.683 -0.006,7.493 0.015 M8.853 1.563 C 9.967 1.707,11.010 2.136,11.944 2.834 C 12.273 3.080,12.920 3.727,13.166 4.056 C 13.727 4.807,14.142 5.690,14.330 6.535 C 14.544 7.500,14.544 8.500,14.330 9.465 C 13.916 11.326,12.605 12.978,10.867 13.828 C 10.239 14.135,9.591 14.336,8.880 14.444 C 8.456 14.509,7.544 14.509,7.120 14.444 C 5.172 14.148,3.528 13.085,2.493 11.451 C 2.279 11.114,1.999 10.526,1.859 10.119 C 1.618 9.422,1.514 8.781,1.514 8.000 C 1.514 6.961,1.715 6.075,2.160 5.160 C 2.500 4.462,2.846 3.980,3.413 3.413 C 3.980 2.846,4.462 2.500,5.160 2.160 C 6.313 1.599,7.567 1.397,8.853 1.563 M7.706 4.290 C 7.482 4.363,7.355 4.491,7.293 4.705 C 7.257 4.827,7.253 5.106,7.259 6.816 C 7.267 8.786,7.267 8.787,7.325 8.896 C 7.398 9.033,7.538 9.157,7.671 9.204 C 7.803 9.250,8.197 9.250,8.329 9.204 C 8.462 9.157,8.602 9.033,8.675 8.896 C 8.733 8.787,8.733 8.786,8.741 6.816 C 8.749 4.664,8.749 4.662,8.596 4.481 C 8.472 4.333,8.339 4.284,8.040 4.276 C 7.893 4.272,7.743 4.278,7.706 4.290 M7.786 10.530 C 7.597 10.592,7.410 10.753,7.319 10.932 C 7.249 11.072,7.237 11.325,7.294 11.495 C 7.388 11.780,7.697 12.000,8.000 12.000 C 8.303 12.000,8.612 11.780,8.706 11.495 C 8.763 11.325,8.751 11.072,8.681 10.932 C 8.616 10.804,8.460 10.646,8.333 10.580 C 8.217 10.520,7.904 10.491,7.786 10.530 "
-							stroke="none"
-							fill-rule="evenodd"
-							fill="#fb2c36"
-						></path></g
-					></svg
-				>
-				<p class="text-3xl text-red-500">Error</p>
-			</div>
-
-			<p class="text-lg">{errorMessage}</p>
-
-			<button
-				onclick={() => goto("Exchange")}
-				class="bg-gray-200 py-1 px-10 rounded hover:bg-gray-400 active:bg-gray-400"
-				>Ok</button
-			>
-		</div>
-	</main>
-{/if}
-
-<style>
-	.progress-container {
-		width: 100%;
-		min-height: 10px;
-		background-color: #6f6f6f;
-		overflow: hidden;
-		margin-top: 10px;
-		box-shadow: 0px 5px 3px 0px #000000;
-	}
-
-	.progress-bar {
-		height: 100%;
-		transition: width 0.1s linear;
-		height:10px;
-	}
-</style>
+        <Modal
+            isOpen={isModalOpen}
+            message={qrMessage}
+            status={qrStatus}
+            amountCrypto={cryptoAmountDisplay}
+            cryptoSymbol={cryptoId === "btc" ? "BTC" : cryptoId.toUpperCase()}
+            {amountFiat}
+            {fiatSymbol}
+            {paymentReference}
+        />
+    </div>
+</main>
