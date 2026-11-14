@@ -42,7 +42,7 @@
 
     function closeModal() {
         isOpen = false;
-        goto("/tejory-terminal");
+        goto("/");
     }
 
     // --- QR RECEIPT LOGIC ---
